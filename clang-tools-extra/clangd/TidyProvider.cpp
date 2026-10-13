@@ -222,7 +222,7 @@ TidyProvider disableUnusableChecks(llvm::ArrayRef<std::string> ExtraBadChecks) {
       // incomplete code.
       "-bugprone-unchecked-optional-access",
       "-bugprone-dataflow-dead-code", 
-      "-bugprone-unchecked-optional-access",
+      "-bugprone-null-check-after-dereference",
       "-abseil-unchecked-statusor-access");
 
   size_t Size = BadChecks.size();
