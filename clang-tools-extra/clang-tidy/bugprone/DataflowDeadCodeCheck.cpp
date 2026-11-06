@@ -9,68 +9,44 @@
 #include "DataflowDeadCodeCheck.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclCXX.h"
-#include "clang/AST/DeclTemplate.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
 #include "clang/ASTMatchers/ASTMatchers.h"
-#include "clang/Analysis/CFG.h"
-#include "clang/Analysis/FlowSensitive/DataflowAnalysisContext.h"
-#include "clang/Analysis/FlowSensitive/DataflowEnvironment.h"
-#include "clang/Analysis/FlowSensitive/DataflowLattice.h"
 #include "clang/Analysis/FlowSensitive/Models/DeadCodeModel.h"
-#include "clang/Analysis/FlowSensitive/NoopAnalysis.h"
-#include "clang/Analysis/FlowSensitive/WatchedLiteralsSolver.h"
-#include "clang/Basic/SourceLocation.h"
-#include "llvm/ADT/Any.h"
-#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
-#include <clang/Analysis/FlowSensitive/AdornedCFG.h>
-#include <memory>
-#include <vector>
+#include <cassert>
+#include <optional>
+#include <utility>
 
 namespace clang::tidy::bugprone {
 
 using ast_matchers::MatchFinder;
 using dataflow::DeadCodeDiagnoser;
 using dataflow::DeadCodeModel;
-using dataflow::NoopAnalysis;
 using Diagnoser = DeadCodeDiagnoser;
+using Diagnostic = DeadCodeDiagnoser::DiagnosticEntry;
+using ResultType = Diagnoser::ResultType;
 
 static constexpr llvm::StringLiteral FuncID("fun");
 
-struct ExpandedResult {
-  Diagnoser::DiagnosticEntry Entry;
-  std::optional<SourceLocation> DerefLoc;
-};
-
-using ResultType = Diagnoser::ResultType;
-
 static std::optional<ResultType> analyzeFunction(const FunctionDecl &FuncDecl) {
-  using dataflow::AdornedCFG;
-  using dataflow::DataflowAnalysisState;
-  using llvm::Expected;
-
   ASTContext &ASTCtx = FuncDecl.getASTContext();
 
   if (!FuncDecl.doesThisDeclarationHaveABody()) {
     return std::nullopt;
   }
 
-  Expected<AdornedCFG> Context =
-      AdornedCFG::build(FuncDecl, *FuncDecl.getBody(), ASTCtx);
-  if (!Context)
-    return std::nullopt;
-
-  dataflow::DataflowAnalysisContext AnalysisContext(
-      std::make_unique<dataflow::WatchedLiteralsSolver>());
-  dataflow::Environment Env(AnalysisContext, FuncDecl);
-  DeadCodeModel Analysis(ASTCtx);
-  Diagnoser Diagnoser;
-
+  Diagnoser DiagnoserInstance;
   ResultType Diagnostics;
 
+  clang::dataflow::DiagnosisCallbacks<DeadCodeModel, Diagnostic> Callbacks = {
+    nullptr,
+    DiagnoserInstance
+  };
+
   if (llvm::Error E =
-          dataflow::diagnoseFunction<DeadCodeModel, Diagnoser::DiagnosticEntry>(
-              FuncDecl, ASTCtx, Diagnoser)
+          dataflow::diagnoseFunction<DeadCodeModel, Diagnostic>(
+              FuncDecl, ASTCtx, Callbacks)
               .moveInto(Diagnostics)) {
     llvm::dbgs() << "Dataflow analysis failed: " << llvm::toString(std::move(E))
                  << ".\n";
@@ -100,19 +76,16 @@ void DataflowDeadCodeCheck::check(const MatchFinder::MatchResult &Result) {
 
   const auto *FuncDecl = Result.Nodes.getNodeAs<FunctionDecl>(FuncID);
   assert(FuncDecl && "invalid FuncDecl matcher");
-  if (FuncDecl->isTemplated())
+  if (FuncDecl->isImplicit()
+    || Result.SourceManager->isInSystemHeader(FuncDecl->getLocation())
+    || FuncDecl->isTemplated())
     return;
 
   if (const auto Diagnostics = analyzeFunction(*FuncDecl)) {
-    for (const auto [Loc, Type] : *Diagnostics) {
-
+    for (const auto &[Loc, Type] : *Diagnostics) {
       switch (Type) {
-      case Diagnoser::DiagnosticType::AlwaysTrue:
-        diag(Loc, "dead code - branching condition is always true");
-        break;
-
-      case Diagnoser::DiagnosticType::AlwaysFalse:
-        diag(Loc, "dead code - branching condition is always false");
+      case Diagnoser::DiagnosticType::Unreachable:
+        diag(Loc, "unreachable code");
         break;
       }
     }

@@ -1,4 +1,4 @@
-//===-- NullPointerAnalysisModel.cpp ----------------------------*- C++ -*-===//
+//===-- DeadCodeModel.cpp ----------------------------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -28,67 +28,88 @@ namespace {
 using namespace ast_matchers;
 using Diagnoser = DeadCodeDiagnoser;
 
-constexpr char kCond[] = "condition";
+constexpr char ifWithStmt[] = "ifWithStmt";
+constexpr char ifWithCompoundStmt[] = "ifWithCompoundStmt";
 
 auto conditionMatcher() {
-  return expr(allOf(hasType(booleanType()), unless(cxxBoolLiteral())))
-      .bind(kCond);
+  return 
+    stmt(
+      anyOf(
+        hasParent(
+          ifStmt().bind(ifWithStmt)
+        ),
+        hasParent(
+          compoundStmt(
+            hasParent(
+              ifStmt().bind(ifWithCompoundStmt)
+            )
+          )
+        )
+      )
+    );
 }
 
 DeadCodeDiagnoser::ResultType
-diagnoseAnyDeadCondition(const Expr *S, const MatchFinder::MatchResult &Result,
+diagnoseAnyDeadCondition(const Stmt *S, const MatchFinder::MatchResult &Result,
                          const Environment &Env) {
-  const auto *Cond = Result.Nodes.getNodeAs<Expr>(kCond);
-  assert(Cond != nullptr);
+  llvm::outs() << "\n========== CFG CALLBACK ==========\n";
 
-  Value *Val = Env.getValue(*Cond);
-  if (!Val || !Val->getProperty(kCond))
-    return {};
-
-  if (Env.allows(Env.getBoolLiteralValue(false).formula())) {
-    // We are already in a dead code section, bail early
+  const IfStmt *If = nullptr;
+  If = Result.Nodes.getNodeAs<IfStmt>(ifWithCompoundStmt);
+  if (!If) {
+    If = Result.Nodes.getNodeAs<IfStmt>(ifWithStmt);
+  } 
+  if (!If) {
+    llvm::outs() << "Missing if\n";
     return {};
   }
 
-  if (BoolValue *CondValue = cast_or_null<BoolValue>(Env.getValue(*Cond))) {
-    if (Env.proves(CondValue->formula())) {
-      return {{Cond->getBeginLoc(), Diagnoser::DiagnosticType::AlwaysTrue}};
-    }
+  const Stmt *Then = If->getThen();
+  const Stmt *Else = If->getElse();
 
-    if (Env.proves(Env.arena().makeNot(CondValue->formula()))) {
-      return {{Cond->getBeginLoc(), Diagnoser::DiagnosticType::AlwaysFalse}};
-    }
+  If->dumpColor();
+
+  llvm::outs() << "Statement type: " << If->getStmtClassName() << "\n";
+
+  if (If->getBeginLoc().isValid()) {
+    If->getBeginLoc().print(llvm::outs(), *Result.SourceManager);
+    llvm::outs() << "\n";
   }
 
-  return {};
-}
+  const Expr *Condition = If->getCond();
+  Value *Val = Env.getValue(*Condition);
+  if (!Val) {
+    llvm::outs() << "Null expr value\n";
+    return {};
+  }
 
-DeadCodeDiagnoser::ResultType catchall(const Stmt *S,
-                                       const MatchFinder::MatchResult &Result,
-                                       const Environment &Env) {
-  S->dump();
+  auto BoolVal = dyn_cast<BoolValue>(Val);
+  if (!BoolVal) {
+    llvm::outs() << "Null bool value\n";
+    return {};
+  }
+
+  if (Env.proves(Env.makeNot(*BoolVal).formula())) {
+    return {{Then->getBeginLoc(), Diagnoser::DiagnosticType::Unreachable}};
+  }
+
+  if (Else && Env.proves(BoolVal->formula())) {
+    return {{Else->getBeginLoc(), Diagnoser::DiagnosticType::Unreachable}};
+  }
+
   return {};
 }
 
 auto buildDiagnoseMatchSwitch() {
-  return CFGMatchSwitchBuilder<const Environment, Diagnoser::ResultType>()
-      .CaseOfCFGStmt<Expr>(conditionMatcher(), diagnoseAnyDeadCondition)
-      .Build();
-}
-
+   return CFGMatchSwitchBuilder<const Environment, Diagnoser::ResultType>()
+       .CaseOfCFGStmt<Stmt>(conditionMatcher(), diagnoseAnyDeadCondition)
+       .Build();
+ }
 } // namespace
 
 void DeadCodeModel::transferBranch(bool Branch, const Stmt *S,
                                    NoopLattice &State, Environment &Env) {
-  if (!S || !isa<Expr>(S))
-    return;
-
-  Value *Val = Env.getValue(*cast<Expr>(S));
-
-  if (!Val)
-    return;
-
-  Val->setProperty(kCond, Env.getBoolLiteralValue(true));
+  
 }
 
 DeadCodeDiagnoser::DeadCodeDiagnoser()
@@ -99,5 +120,4 @@ DeadCodeDiagnoser::ResultType DeadCodeDiagnoser::operator()(
     const TransferStateForDiagnostics<NoopLattice> &State) {
   return DiagnoseMatchSwitch(Elt, Ctx, State.Env);
 }
-
 } // namespace clang::dataflow
