@@ -52,7 +52,7 @@ auto conditionMatcher() {
 DeadCodeDiagnoser::ResultType
 diagnoseAnyDeadCondition(const Stmt *S, const MatchFinder::MatchResult &Result,
                          const Environment &Env) {
-  llvm::outs() << "\n========== CFG CALLBACK ==========\n";
+  //llvm::outs() << "\n========== CFG CALLBACK ==========\n";
 
   const IfStmt *If = nullptr;
   If = Result.Nodes.getNodeAs<IfStmt>(ifWithCompoundStmt);
@@ -67,25 +67,25 @@ diagnoseAnyDeadCondition(const Stmt *S, const MatchFinder::MatchResult &Result,
   const Stmt *Then = If->getThen();
   const Stmt *Else = If->getElse();
 
-  If->dumpColor();
+  //If->dumpColor();
 
-  llvm::outs() << "Statement type: " << If->getStmtClassName() << "\n";
+  //llvm::outs() << "Statement type: " << If->getStmtClassName() << "\n";
 
   if (If->getBeginLoc().isValid()) {
     If->getBeginLoc().print(llvm::outs(), *Result.SourceManager);
-    llvm::outs() << "\n";
+    //llvm::outs() << "\n";
   }
 
   const Expr *Condition = If->getCond();
   Value *Val = Env.getValue(*Condition);
   if (!Val) {
-    llvm::outs() << "Null expr value\n";
+    //llvm::outs() << "Null expr value\n";
     return {};
   }
 
   auto BoolVal = dyn_cast<BoolValue>(Val);
   if (!BoolVal) {
-    llvm::outs() << "Null bool value\n";
+    //llvm::outs() << "Null bool value\n";
     return {};
   }
 
