@@ -48,13 +48,15 @@ public:
 private:
   CFGMatchSwitch<const Environment, ResultType> DiagnoseMatchSwitch;
 
+  const ASTContext *CachedContext = nullptr;
+  llvm::SmallVector<const IfStmt *, 32> IfStatements;
+
 public:
   DeadCodeDiagnoser();
 
   ResultType operator()(const CFGElement &Elt, ASTContext &Ctx,
                         const TransferStateForDiagnostics<NoopLattice> &State);
 };
-
 } // namespace clang::dataflow
 
 #endif

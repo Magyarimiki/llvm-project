@@ -18,6 +18,9 @@
 #include <optional>
 #include <utility>
 
+#include "clang/Analysis/FlowSensitive/MatchSwitch.h"
+#include "clang/Analysis/CFG.h"
+
 namespace clang::tidy::bugprone {
 
 using ast_matchers::MatchFinder;
@@ -70,7 +73,17 @@ void DataflowDeadCodeCheck::registerMatchers(MatchFinder *Finder) {
       this);
 }
 
+static unsigned FunctionCount = 0;
+
 void DataflowDeadCodeCheck::check(const MatchFinder::MatchResult &Result) {
+  const auto *FD = Result.Nodes.getNodeAs<FunctionDecl>(FuncID);
+
+  if (FD) {
+    llvm::outs() << "CHECK: " << FD->getQualifiedNameAsString() << " at "
+                 << Result.SourceManager->getSpellingLineNumber(
+                        FD->getLocation())
+                 << "\n";
+  }
   if (Result.SourceManager->getDiagnostics().hasUncompilableErrorOccurred())
     return;
 
@@ -80,6 +93,8 @@ void DataflowDeadCodeCheck::check(const MatchFinder::MatchResult &Result) {
     || Result.SourceManager->isInSystemHeader(FuncDecl->getLocation())
     || FuncDecl->isTemplated())
     return;
+  FunctionCount++;
+  llvm::outs() << "Function analysis: " << FunctionCount << "\n";
 
   if (const auto Diagnostics = analyzeFunction(*FuncDecl)) {
     for (const auto &[Loc, Type] : *Diagnostics) {
