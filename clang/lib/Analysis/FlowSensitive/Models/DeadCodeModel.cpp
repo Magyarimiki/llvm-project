@@ -1,8 +1,7 @@
-
-//===-- DeadCodeModel.cpp ----------------------------*- C++ -*-===//
+//===-- DeadCodeModel.cpp ---------------------------------------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// See https://llvm.org for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
@@ -10,266 +9,155 @@
 #include "clang/Analysis/FlowSensitive/Models/DeadCodeModel.h"
 
 #include "clang/AST/ASTContext.h"
-#include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
-#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/AST/Stmt.h"
-#include "clang/ASTMatchers/ASTMatchFinder.h"
-#include "clang/ASTMatchers/ASTMatchers.h"
 #include "clang/Analysis/CFG.h"
-#include "clang/Analysis/FlowSensitive/CFGMatchSwitch.h"
-#include "clang/Analysis/FlowSensitive/DataflowAnalysis.h"
 #include "clang/Analysis/FlowSensitive/DataflowEnvironment.h"
-#include "clang/Analysis/FlowSensitive/DataflowLattice.h"
-#include "clang/Analysis/FlowSensitive/MapLattice.h"
+#include "clang/Analysis/FlowSensitive/Formula.h"
 #include "clang/Analysis/FlowSensitive/NoopLattice.h"
-
-#include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/Twine.h"
-
-#include <iterator>
-#include <vector>
+#include "clang/Analysis/FlowSensitive/Value.h"
 
 namespace clang::dataflow {
 namespace {
 
-using namespace ast_matchers;
-using Diagnoser = DeadCodeDiagnoser;
+enum class EvaluatedBool { Unknown, True, False };
 
-//auto conditionMatcher() { return stmt(); }
+const Formula *buildFormula(const Expr *E, const Environment &Env) {
+  if (!E)
+    return nullptr;
 
-class IfStmtCollector : public RecursiveASTVisitor<IfStmtCollector> {
-public:
-  explicit IfStmtCollector(ASTContext &Context) : Context(&Context) {}
+  E = E->IgnoreParenImpCasts();
 
-  bool VisitIfStmt(IfStmt *If) {
-    if (If->getBeginLoc().isInvalid())
-      return true;
-
-    if (Context->getSourceManager().isInSystemHeader(If->getBeginLoc()))
-      return true;
-
-    IfStatements.push_back(If);
-    return true;
+  Value *V = Env.getValue(*E);
+  if (!V) {
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(E))
+      V = Env.getValue(*Ref->getDecl());
   }
 
-  std::vector<IfStmt *> IfStatements;
+  if (const auto *BV = dyn_cast_or_null<BoolValue>(V))
+    return &BV->formula();
 
-private:
-  ASTContext *Context;
-};
+  auto &Arena = Env.arena();
 
+  if (const auto *BL = dyn_cast<CXXBoolLiteralExpr>(E))
+    return &Arena.makeLiteral(BL->getValue());
 
-class StmtFinder : public clang::RecursiveASTVisitor<StmtFinder> {
-public:
-  explicit StmtFinder(const clang::Stmt *Target) : Target(Target) {}
-
-  bool Found = false;
-  bool VisitStmt(clang::Stmt *S) {
-    if (S == Target) {
-      Found = true;
-      return false;
+  if (const auto *U = dyn_cast<UnaryOperator>(E)) {
+    if (U->getOpcode() == UO_LNot) {
+      if (const Formula *Sub = buildFormula(U->getSubExpr(), Env))
+        return &Arena.makeNot(*Sub);
     }
-
-    return true;
   }
 
-private:
-  const clang::Stmt *Target;
-};
-
-static bool isInside(const clang::Stmt *Root, const clang::Stmt *Target) {
-  if (!Root || !Target)
-    return false;
-
-  StmtFinder Finder(Target);
-  Finder.TraverseStmt(const_cast<clang::Stmt *>(Root));
-
-  return Finder.Found;
-}
-
-DeadCodeDiagnoser::ResultType
-diagnoseAnyDeadCondition(const Stmt *S, const MatchFinder::MatchResult &Result,
-                         const Environment &Env,
-                         llvm::ArrayRef<const IfStmt *> IfStatements) {
-
-  if (!Result.Context || !Result.SourceManager)
-    return {};
-
-  enum class BoolKnowledge { Unknown, True, False };
-
-  auto EvaluateBool = [&](auto &&Self, const Expr *E) -> BoolKnowledge {
-    if (!E)
-      return BoolKnowledge::Unknown;
-
-    E = E->IgnoreParenImpCasts();
-
-    if (const auto *BL = dyn_cast<CXXBoolLiteralExpr>(E)) {
-      return BL->getValue() ? BoolKnowledge::True : BoolKnowledge::False;
-    }
-
-    if (const auto *U = dyn_cast<UnaryOperator>(E)) {
-      if (U->getOpcode() == UO_LNot) {
-        BoolKnowledge Result = Self(Self, U->getSubExpr());
-
-        if (Result == BoolKnowledge::True)
-          return BoolKnowledge::False;
-
-        if (Result == BoolKnowledge::False)
-          return BoolKnowledge::True;
-
-        return BoolKnowledge::Unknown;
-      }
-    }
-
-    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
-      if (BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr) {
-        BoolKnowledge L = Self(Self, BO->getLHS());
-        BoolKnowledge R = Self(Self, BO->getRHS());
-
-        if (BO->getOpcode() == BO_LAnd) {
-          if (L == BoolKnowledge::False || R == BoolKnowledge::False)
-            return BoolKnowledge::False;
-
-          if (L == BoolKnowledge::True && R == BoolKnowledge::True)
-            return BoolKnowledge::True;
-
-          return BoolKnowledge::Unknown;
-        }
-
-        if (BO->getOpcode() == BO_LOr) {
-          if (L == BoolKnowledge::True || R == BoolKnowledge::True)
-            return BoolKnowledge::True;
-
-          if (L == BoolKnowledge::False && R == BoolKnowledge::False)
-            return BoolKnowledge::False;
-
-          return BoolKnowledge::Unknown;
-        }
-      }
-
-      if (BO->getOpcode() == BO_EQ || BO->getOpcode() == BO_NE) {
-        BoolKnowledge L = Self(Self, BO->getLHS());
-        BoolKnowledge R = Self(Self, BO->getRHS());
-
-        if (L != BoolKnowledge::Unknown && R != BoolKnowledge::Unknown) {
-          bool Equal = (L == R);
-
-          if (BO->getOpcode() == BO_EQ) {
-            return Equal ? BoolKnowledge::True : BoolKnowledge::False;
-          }
-
-          return Equal ? BoolKnowledge::False : BoolKnowledge::True;
-        }
-      }
-    }
-
-    Value *V = Env.getValue(*E);
-    if (!V) {
-      if (const auto *Ref = dyn_cast<DeclRefExpr>(E))
-        V = Env.getValue(*Ref->getDecl());
-    }
-
-    if (const auto *BV = dyn_cast_or_null<BoolValue>(V)) {
-      if (Env.proves(BV->formula()))
-        return BoolKnowledge::True;
-
-      if (Env.proves(Env.arena().makeNot(BV->formula())))
-        return BoolKnowledge::False;
-    }
-
-    return BoolKnowledge::Unknown;
-  };
-
-  for (auto It = IfStatements.rbegin(); It != IfStatements.rend(); ++It) {
-    const IfStmt *If = *It;
-    const Stmt *Then = If->getThen();
-    const Stmt *Else = If->getElse();
-    const bool InThen = isInside(Then, S);
-    const bool InElse = isInside(Else, S);
-    const bool InCondition = isInside(If->getCond(), S);
-
-    if (!InThen && !InElse && !InCondition)
-      continue;
-
-    // Only evaluate the condition when the current CFG statement
-    // belongs to this IfStmt's condition.
-    if (!InCondition)
-      continue;
-
-    // Process only the innermost enclosing if statement.
-    bool IsInsideInnerIf = false;
-
-    for (auto InnerIt = IfStatements.rbegin(); InnerIt != It; ++InnerIt) {
-      const IfStmt *InnerIf = *InnerIt;
-
-      if (isInside(InnerIf->getCond(), S) || isInside(InnerIf->getThen(), S) ||
-          isInside(InnerIf->getElse(), S)) {
-
-        IsInsideInnerIf = true;
+  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+    const Formula *Left = buildFormula(BO->getLHS(), Env);
+    const Formula *Right = buildFormula(BO->getRHS(), Env);
+    if (Left && Right) {
+      switch (BO->getOpcode()) {
+      case BO_LAnd:
+        return &Arena.makeAnd(*Left, *Right);
+      case BO_LOr:
+        return &Arena.makeOr(*Left, *Right);
+      case BO_EQ:
+        return &Arena.makeEquals(*Left, *Right);
+      case BO_NE:
+        return &Arena.makeNot(Arena.makeEquals(*Left, *Right));
+      default:
         break;
       }
     }
-
-    if (IsInsideInnerIf)
-      continue;
-
-    if (!Env.allows(Env.arena().makeLiteral(true)))
-      continue;
-
-    const Expr *Condition = If->getCond();
-    BoolKnowledge ConditionResult = EvaluateBool(EvaluateBool, Condition);
-    const bool ConditionTrue = ConditionResult == BoolKnowledge::True;
-    const bool ConditionFalse = ConditionResult == BoolKnowledge::False;
-
-    if (ConditionTrue && Else) {
-      return {{Else->getBeginLoc(), Diagnoser::DiagnosticType::Unreachable}};
-    }
-
-    if (ConditionFalse) {
-      return {{Then->getBeginLoc(), Diagnoser::DiagnosticType::Unreachable}};
-    }
   }
 
-  return {};
+  return nullptr;
 }
+
+EvaluatedBool evaluateCondition(const Expr *Cond, const Environment &Env) {
+  const Formula *F = buildFormula(Cond, Env);
+  if (!F)
+    return EvaluatedBool::Unknown;
+
+  if (Env.proves(*F))
+    return EvaluatedBool::True;
+
+  if (Env.proves(Env.arena().makeNot(*F)))
+    return EvaluatedBool::False;
+
+  return EvaluatedBool::Unknown;
+}
+
+const IfStmt *getEnclosingIf(const Stmt *S, ASTContext &Ctx) {
+  const Stmt *Curr = S;
+  while (Curr) {
+    const auto &Parents = Ctx.getParents(*Curr);
+    if (Parents.empty())
+      return nullptr;
+
+    // FIXME : Parents[0] is not always the correct choice
+    const Stmt *ParentStmt = Parents[0].get<Stmt>();
+    if (!ParentStmt)
+      return nullptr;
+
+    if (const auto *If = dyn_cast<IfStmt>(ParentStmt)) {
+      if (If->getCond() == Curr)
+        return If;
+      return nullptr;
+    }
+
+    if (isa<ImplicitCastExpr>(ParentStmt) || isa<ParenExpr>(ParentStmt) ||
+        isa<ExprWithCleanups>(ParentStmt) || isa<UnaryOperator>(ParentStmt) ||
+        isa<BinaryOperator>(ParentStmt)) {
+      Curr = ParentStmt;
+      continue;
+    }
+
+    return nullptr;
+  }
+  return nullptr;
+}
+
 } // namespace
 
-void DeadCodeModel::transferBranch(bool Branch, const Stmt *S,
-                                   NoopLattice &State, Environment &Env) {}
-
-DeadCodeDiagnoser::DeadCodeDiagnoser()
-    : DiagnoseMatchSwitch(
-          CFGMatchSwitchBuilder<const Environment, ResultType>()
-              .CaseOfCFGStmt<Stmt>(
-                  conditionMatcher(),
-                  [this](const Stmt *S, const MatchFinder::MatchResult &Result,
-                         const Environment &Env) {
-                    return diagnoseAnyDeadCondition(S, Result, Env,
-                                                    IfStatements);
-                  })
-              .Build()) {}
+DeadCodeDiagnoser::DeadCodeDiagnoser() = default;
 
 DeadCodeDiagnoser::ResultType DeadCodeDiagnoser::operator()(
     const CFGElement &Elt, ASTContext &Ctx,
     const TransferStateForDiagnostics<NoopLattice> &State) {
 
-  // Collect IfStmt nodes only once for each ASTContext.
-  if (CachedContext != &Ctx) {
-    IfStatements.clear();
-    IfStmtCollector Collector(Ctx);
+  auto StmtElt = Elt.getAs<CFGStmt>();
+  if (!StmtElt)
+    return {};
 
-    Collector.TraverseDecl(Ctx.getTranslationUnitDecl());
+  const IfStmt *If = getEnclosingIf(StmtElt->getStmt(), Ctx);
+  if (!If)
+    return {};
 
-    IfStatements.append(Collector.IfStatements.begin(),
-                        Collector.IfStatements.end());
+  if (If->getBeginLoc().isInvalid() ||
+      Ctx.getSourceManager().isInSystemHeader(If->getBeginLoc()))
+    return {};
 
-    CachedContext = &Ctx;
+  if (!State.Env.allows(State.Env.arena().makeLiteral(true)))
+    return {};
+
+  if (DiagnosedIfs.contains(If))
+    return {};
+
+  EvaluatedBool CondResult = evaluateCondition(If->getCond(), State.Env);
+
+  ResultType Diagnostics;
+  // FIXME: add markers to the first stmt of a compound stmt
+  if (CondResult == EvaluatedBool::True && If->getElse()) {
+    DiagnosedIfs.insert(If);
+    Diagnostics.push_back(
+        {If->getElse()->getBeginLoc(), DiagnosticType::Unreachable});
+  } else if (CondResult == EvaluatedBool::False) {
+    DiagnosedIfs.insert(If);
+    Diagnostics.push_back(
+        {If->getThen()->getBeginLoc(), DiagnosticType::Unreachable});
   }
 
-  return DiagnoseMatchSwitch(Elt, Ctx, State.Env);
+  return Diagnostics;
 }
+
 } // namespace clang::dataflow

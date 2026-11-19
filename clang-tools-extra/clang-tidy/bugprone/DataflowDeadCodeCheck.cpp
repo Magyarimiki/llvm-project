@@ -62,28 +62,20 @@ static std::optional<ResultType> analyzeFunction(const FunctionDecl &FuncDecl) {
 void DataflowDeadCodeCheck::registerMatchers(MatchFinder *Finder) {
   using namespace ast_matchers;
   Finder->addMatcher(
-      decl(
-          anyOf(functionDecl(unless(isExpansionInSystemHeader()),
-                             // FIXME: Remove the filter below when lambdas are
-                             // well supported by the check.
-                             unless(hasDeclContext(cxxRecordDecl(isLambda())))),
-                cxxConstructorDecl(
-                    unless(hasDeclContext(cxxRecordDecl(isLambda()))))))
-          .bind(FuncID),
-      this);
+    functionDecl(
+      isDefinition(),
+      unless(isExpansionInSystemHeader()),
+      unless(isTemplateInstantiation()),
+      unless(hasDeclContext(cxxRecordDecl(isLambda())))
+    )
+    .bind(FuncID), this);
 }
 
 static unsigned FunctionCount = 0;
 
 void DataflowDeadCodeCheck::check(const MatchFinder::MatchResult &Result) {
   const auto *FD = Result.Nodes.getNodeAs<FunctionDecl>(FuncID);
-
-  if (FD) {
-    llvm::outs() << "CHECK: " << FD->getQualifiedNameAsString() << " at "
-                 << Result.SourceManager->getSpellingLineNumber(
-                        FD->getLocation())
-                 << "\n";
-  }
+  
   if (Result.SourceManager->getDiagnostics().hasUncompilableErrorOccurred())
     return;
 
@@ -91,10 +83,16 @@ void DataflowDeadCodeCheck::check(const MatchFinder::MatchResult &Result) {
   assert(FuncDecl && "invalid FuncDecl matcher");
   if (FuncDecl->isImplicit()
     || Result.SourceManager->isInSystemHeader(FuncDecl->getLocation())
-    || FuncDecl->isTemplated())
+    || FuncDecl->isTemplated() || FuncDecl->isTemplateInstantiation())
     return;
+  /*if (FD) {
+    llvm::outs() << "CHECK: " << FD->getQualifiedNameAsString() << " at "
+                 << Result.SourceManager->getSpellingLineNumber(
+                        FD->getLocation())
+                 << "\n";
+  }
   FunctionCount++;
-  llvm::outs() << "Function analysis: " << FunctionCount << "\n";
+  llvm::outs() << "Function analysis: " << FunctionCount << "\n";*/
 
   if (const auto Diagnostics = analyzeFunction(*FuncDecl)) {
     for (const auto &[Loc, Type] : *Diagnostics) {

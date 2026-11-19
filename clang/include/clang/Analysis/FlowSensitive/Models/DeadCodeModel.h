@@ -31,7 +31,7 @@ public:
   void transfer(const CFGElement &E, NoopLattice &State, Environment &Env) {}
 
   void transferBranch(bool Branch, const Stmt *S, NoopLattice &State,
-                      Environment &Env);
+                      Environment &Env) {}
 };
 
 class DeadCodeDiagnoser {
@@ -48,8 +48,8 @@ public:
 private:
   CFGMatchSwitch<const Environment, ResultType> DiagnoseMatchSwitch;
 
-  const ASTContext *CachedContext = nullptr;
-  llvm::SmallVector<const IfStmt *, 32> IfStatements;
+  llvm::DenseSet<const IfStmt *> DiagnosedIfs;
+
 
 public:
   DeadCodeDiagnoser();
