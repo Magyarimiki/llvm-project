@@ -122,46 +122,61 @@ const IfStmt *getEnclosingIf(const Stmt *S, ASTContext &Ctx) {
 
 DeadCodeDiagnoser::DeadCodeDiagnoser() = default;
 
-// Invalidate all booleans modified inside a lambda
+// Invalidate all booleans modified inside a lambda (using capture by ref).
+// Invalidation is done after the lambda invocation.
+// 
+// TODO: add support for modifications via captured pointers.
 void DeadCodeModel::transfer(const CFGElement &E, NoopLattice &State,
                              Environment &Env) {
   auto StmtElt = E.getAs<CFGStmt>();
   if (!StmtElt)
     return;
 
-  const auto *OpCall = dyn_cast<CXXOperatorCallExpr>(StmtElt->getStmt());
-  if (!OpCall)
-    return;
+  llvm::ArrayRef<const clang::Expr *> Args;
+  const auto *CCall = dyn_cast<CXXConstructExpr>(StmtElt->getStmt());
+  if (CCall) {
+    auto Ctor = CCall->getConstructor();
+    if (!Ctor || !Ctor->getParent()->isLambda())
+      Args = llvm::ArrayRef(CCall->getArgs(), CCall->getNumArgs());
+  } else {
+    const auto *Call = dyn_cast<CallExpr>(StmtElt->getStmt());
+    if (Call)
+      Args = llvm::ArrayRef(Call->getArgs(), Call->getNumArgs());
+  }
+  
+  for (const Expr *Arg : Args) {
+    if (!Arg)
+      continue;
 
-  if (OpCall->getOperator() != clang::OO_Call || OpCall->getNumArgs() == 0)
-    return;
+    const Expr *ThisCall = Arg->IgnoreParenImpCasts();
+    if (!ThisCall)
+      continue;
 
-  const Expr *ThisCall = OpCall->getArg(0)->IgnoreParenImpCasts();
-  if (!ThisCall)
-    return;
+    clang::QualType Type = ThisCall->getType();
+    if (Type->isReferenceType()) {
+      Type = Type->getPointeeType();
+    }
+    const auto *Record = Type->getAsCXXRecordDecl();
+    if (!Record || !Record->isLambda())
+      return;
 
-  const auto *Record = ThisCall->getType()->getAsCXXRecordDecl();
-  if (!Record)
-    return;
+    const clang::CXXMethodDecl *Method = Record->getLambdaCallOperator();
+    if (!Method || !Method->getBody())
+      continue;
 
-  if (!Record->isLambda())
-    return;
+    const Stmt *Body = Method->getBody();
+    ExprMutationAnalyzer Analyzer(*Body, getASTContext());
 
-  const clang::CXXMethodDecl *Method = Record->getLambdaCallOperator();
-  if (!Method)
-    return;
+    for (const clang::LambdaCapture &Capture : Record->captures()) {
+      if (Capture.getCaptureKind() == clang::LCK_ByRef) {
+        const auto *Var = dyn_cast<VarDecl>(Capture.getCapturedVar());
+        if (!Var || !Var->getType()->isBooleanType())
+          continue;
 
-  ExprMutationAnalyzer Analyzer(*Method->getBody(), getASTContext());
-
-  for (const clang::LambdaCapture &Capture : Record->captures()) {
-    if (Capture.getCaptureKind() == clang::LCK_ByRef) {
-      const auto *Var = dyn_cast<VarDecl>(Capture.getCapturedVar());
-      if (!Var || !Var->getType()->isBooleanType())
-        continue;
-
-      if (Analyzer.isMutated(Var)) {
-        if (const auto *Loc = Env.getStorageLocation(*Var)) {
-          Env.setValue(*Loc, Env.makeAtomicBoolValue());
+        if (Analyzer.isMutated(Var)) {
+          if (const auto *Loc = Env.getStorageLocation(*Var)) {
+            Env.setValue(*Loc, Env.makeAtomicBoolValue());
+          }
         }
       }
     }
