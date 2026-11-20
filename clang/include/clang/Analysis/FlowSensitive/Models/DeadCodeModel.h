@@ -28,7 +28,7 @@ public:
 
   static NoopLattice initialElement() { return {}; }
 
-  void transfer(const CFGElement &E, NoopLattice &State, Environment &Env) {}
+  void transfer(const CFGElement &E, NoopLattice &State, Environment &Env);
 
   void transferBranch(bool Branch, const Stmt *S, NoopLattice &State,
                       Environment &Env) {}

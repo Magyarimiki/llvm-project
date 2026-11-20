@@ -103,6 +103,7 @@ void DataflowDeadCodeCheck::check(const MatchFinder::MatchResult &Result) {
       }
     }
   }
+  // FIXME: Clear DiagnosedIfs
 }
 
 } // namespace clang::tidy::bugprone

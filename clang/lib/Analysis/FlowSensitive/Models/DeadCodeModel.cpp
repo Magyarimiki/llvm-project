@@ -18,6 +18,7 @@
 #include "clang/Analysis/FlowSensitive/Formula.h"
 #include "clang/Analysis/FlowSensitive/NoopLattice.h"
 #include "clang/Analysis/FlowSensitive/Value.h"
+#include <clang/Analysis/Analyses/ExprMutationAnalyzer.h>
 
 namespace clang::dataflow {
 namespace {
@@ -121,6 +122,52 @@ const IfStmt *getEnclosingIf(const Stmt *S, ASTContext &Ctx) {
 
 DeadCodeDiagnoser::DeadCodeDiagnoser() = default;
 
+// Invalidate all booleans modified inside a lambda
+void DeadCodeModel::transfer(const CFGElement &E, NoopLattice &State,
+                             Environment &Env) {
+  auto StmtElt = E.getAs<CFGStmt>();
+  if (!StmtElt)
+    return;
+
+  const auto *OpCall = dyn_cast<CXXOperatorCallExpr>(StmtElt->getStmt());
+  if (!OpCall)
+    return;
+
+  if (OpCall->getOperator() != clang::OO_Call || OpCall->getNumArgs() == 0)
+    return;
+
+  const Expr *ThisCall = OpCall->getArg(0)->IgnoreParenImpCasts();
+  if (!ThisCall)
+    return;
+
+  const auto *Record = ThisCall->getType()->getAsCXXRecordDecl();
+  if (!Record)
+    return;
+
+  if (!Record->isLambda())
+    return;
+
+  const clang::CXXMethodDecl *Method = Record->getLambdaCallOperator();
+  if (!Method)
+    return;
+
+  ExprMutationAnalyzer Analyzer(*Method->getBody(), getASTContext());
+
+  for (const clang::LambdaCapture &Capture : Record->captures()) {
+    if (Capture.getCaptureKind() == clang::LCK_ByRef) {
+      const auto *Var = dyn_cast<VarDecl>(Capture.getCapturedVar());
+      if (!Var || !Var->getType()->isBooleanType())
+        continue;
+
+      if (Analyzer.isMutated(Var)) {
+        if (const auto *Loc = Env.getStorageLocation(*Var)) {
+          Env.setValue(*Loc, Env.makeAtomicBoolValue());
+        }
+      }
+    }
+  }
+}
+
 DeadCodeDiagnoser::ResultType DeadCodeDiagnoser::operator()(
     const CFGElement &Elt, ASTContext &Ctx,
     const TransferStateForDiagnostics<NoopLattice> &State) {
@@ -136,6 +183,7 @@ DeadCodeDiagnoser::ResultType DeadCodeDiagnoser::operator()(
   if (If->getBeginLoc().isInvalid() ||
       Ctx.getSourceManager().isInSystemHeader(If->getBeginLoc()))
     return {};
+  // FIXME: check then and else locations
 
   if (!State.Env.allows(State.Env.arena().makeLiteral(true)))
     return {};
